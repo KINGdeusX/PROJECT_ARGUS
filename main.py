@@ -4,8 +4,9 @@ import csv
 import pytesseract
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
-    QVBoxLayout, QPushButton, QLabel,
-    QFileDialog, QMessageBox, QComboBox
+    QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+    QFileDialog, QMessageBox, QComboBox,
+    QLineEdit, QCheckBox
 )
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QImage, QPixmap
@@ -49,6 +50,22 @@ class OCRScanner(QMainWindow):
         self.capture_button = QPushButton("Capture & OCR")
         self.capture_button.clicked.connect(self.capture_and_ocr)
         layout.addWidget(self.capture_button)
+
+        # File path row: input + browse
+        path_layout = QHBoxLayout()
+        self.path_label = QLabel("Save to:")
+        path_layout.addWidget(self.path_label)
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText("Select a file to save or append CSV data...")
+        path_layout.addWidget(self.path_edit)
+        self.browse_button = QPushButton("Browse...")
+        self.browse_button.clicked.connect(self.browse_save_path)
+        path_layout.addWidget(self.browse_button)
+        layout.addLayout(path_layout)
+
+        self.append_checkbox = QCheckBox("Append to existing file")
+        self.append_checkbox.setChecked(True)
+        layout.addWidget(self.append_checkbox)
 
         self.export_button = QPushButton("Export to CSV")
         self.export_button.clicked.connect(self.export_to_csv)
@@ -126,21 +143,39 @@ class OCRScanner(QMainWindow):
             f"Captured {len(lines)} lines.\n\n" + "\n".join(lines)
         )
 
+    def browse_save_path(self):
+        """Open file dialog to choose where to save or which file to append to."""
+        start_path = self.path_edit.text().strip() or ""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save or select CSV file",
+            start_path or "",
+            "CSV Files (*.csv)"
+        )
+        if file_path:
+            self.path_edit.setText(file_path)
+
     def export_to_csv(self):
         if not self.extracted_data:
             QMessageBox.warning(self, "No Data", "No OCR data to export.")
             return
 
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save CSV",
-            "",
-            "CSV Files (*.csv)"
-        )
+        file_path = self.path_edit.text().strip()
+        if not file_path:
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save CSV",
+                "",
+                "CSV Files (*.csv)"
+            )
+            if file_path:
+                self.path_edit.setText(file_path)
 
         if file_path:
             try:
-                with open(file_path, mode='a', newline='', encoding='utf-8') as file:
+                append_mode = self.append_checkbox.isChecked()
+                mode = 'a' if append_mode else 'w'
+                with open(file_path, mode=mode, newline='', encoding='utf-8') as file:
                     writer = csv.writer(file)
                     for entry in self.extracted_data:
                         writer.writerow(entry)
