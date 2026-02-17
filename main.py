@@ -20,7 +20,7 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tessera
 class OCRScanner(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Instant OCR Scanner")
+        self.setWindowTitle("Claims Scanner v0.0.1")
         self.setGeometry(100, 100, 800, 600)
 
         self.video_capture = None
