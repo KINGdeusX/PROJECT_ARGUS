@@ -47,6 +47,14 @@ class OCRScanner(QMainWindow):
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.video_label)
 
+        # Flip controls for camera orientation
+        transform_layout = QHBoxLayout()
+        self.flip_horizontal_checkbox = QCheckBox("Flip horizontally")
+        self.flip_vertical_checkbox = QCheckBox("Flip vertically")
+        transform_layout.addWidget(self.flip_horizontal_checkbox)
+        transform_layout.addWidget(self.flip_vertical_checkbox)
+        layout.addLayout(transform_layout)
+
         self.capture_button = QPushButton("Capture & OCR")
         self.capture_button.clicked.connect(self.capture_and_ocr)
         layout.addWidget(self.capture_button)
@@ -66,10 +74,6 @@ class OCRScanner(QMainWindow):
         self.append_checkbox = QCheckBox("Append to existing file")
         self.append_checkbox.setChecked(True)
         layout.addWidget(self.append_checkbox)
-
-        self.export_button = QPushButton("Export to CSV")
-        self.export_button.clicked.connect(self.export_to_csv)
-        layout.addWidget(self.export_button)
 
         central_widget.setLayout(layout)
 
@@ -99,12 +103,27 @@ class OCRScanner(QMainWindow):
     def update_frame(self):
         ret, frame = self.video_capture.read()
         if ret:
-            self.current_frame = frame
-            rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            processed_frame = self.apply_transformations(frame)
+            self.current_frame = processed_frame
+            rgb_image = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_image.shape
             bytes_per_line = ch * w
             qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
             self.video_label.setPixmap(QPixmap.fromImage(qt_image))
+
+    def apply_transformations(self, frame):
+        """Apply orientation adjustments (flip horizontally/vertically)."""
+        flip_h = self.flip_horizontal_checkbox.isChecked()
+        flip_v = self.flip_vertical_checkbox.isChecked()
+
+        if flip_h and flip_v:
+            # Flip both horizontally and vertically
+            return cv2.flip(frame, -1)
+        elif flip_h:
+            return cv2.flip(frame, 1)
+        elif flip_v:
+            return cv2.flip(frame, 0)
+        return frame
 
     def preprocess_image(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -136,6 +155,9 @@ class OCRScanner(QMainWindow):
         lines = lines[:5]
 
         self.extracted_data.append(lines)
+
+        # Automatically export to CSV on each successful capture
+        self.export_to_csv()
 
         QMessageBox.information(
             self,
