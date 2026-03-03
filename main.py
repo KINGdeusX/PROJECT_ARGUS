@@ -9,7 +9,8 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QGroupBox,
     QFileDialog, QMessageBox, QComboBox,
     QLineEdit, QCheckBox, QDoubleSpinBox, QSlider,
-    QSizePolicy
+    QSizePolicy, QDialog, QDialogButtonBox,
+    QFormLayout, QScrollArea
 )
 from PyQt6.QtCore import QTimer, Qt, QSettings, QRect, QPoint
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QMouseEvent
@@ -224,6 +225,53 @@ class VideoLabel(QLabel):
             if wr:
                 painter.drawRect(wr)
         painter.end()
+
+
+import re
+
+
+class OCREditDialog(QDialog):
+    """Dialog that shows one editable QLineEdit per OCR-scanned field."""
+
+    def __init__(self, lines, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Review & Edit Scanned Data")
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Edit the scanned values below before saving:"))
+
+        # Scroll area in case there are many fields
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        form_widget = QWidget()
+        form_layout = QFormLayout(form_widget)
+        form_layout.setContentsMargins(0, 0, 0, 0)
+
+        self._edits = []
+        for i, line in enumerate(lines):
+            field_label = f"Field {i + 1}:"
+            edit = QLineEdit(line)
+            edit.setMinimumWidth(300)
+            form_layout.addRow(field_label, edit)
+            self._edits.append(edit)
+
+        scroll.setWidget(form_widget)
+        layout.addWidget(scroll)
+
+        # Standard OK / Cancel buttons
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def get_values(self):
+        """Return the (possibly edited) list of field strings."""
+        return [edit.text() for edit in self._edits]
 
 
 class OCRScanner(QMainWindow):
@@ -869,16 +917,23 @@ class OCRScanner(QMainWindow):
         # Limit to first 5 lines
         lines = lines[:5]
 
-        self.extracted_data.append(lines)
+        # --- Sanitize the last line to numeric characters only ---
+        # Strip everything that isn't a digit or a decimal point / negative sign
+        last = lines[-1]
+        numeric_only = re.sub(r"[^0-9.\-]", "", last)
+        lines[-1] = numeric_only if numeric_only else last  # keep original if nothing survived
 
-        # Automatically export to CSV on each successful capture
+        # --- Open the edit dialog so the user can review / adjust values ---
+        dialog = OCREditDialog(lines, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            # User cancelled – discard this scan
+            return
+
+        final_lines = dialog.get_values()
+
+        # Append to pending data and write to CSV
+        self.extracted_data.append(final_lines)
         self.export_to_csv()
-
-        QMessageBox.information(
-            self,
-            "OCR Success",
-            f"Captured {len(lines)} lines.\n\n" + "\n".join(lines)
-        )
 
     def browse_save_path(self):
         """Open file dialog to choose where to save or which file to append to."""
