@@ -697,11 +697,6 @@ class OCRScanner(QMainWindow):
         exit_action = file_menu.addAction("Exit")
         exit_action.triggered.connect(self.close)
         
-        # --- Tools Menu ---
-        tools_menu = menubar.addMenu("Tools")
-        manual_entry_action = tools_menu.addAction("Manual Entry")
-        manual_entry_action.triggered.connect(self._manual_entry)
-        
         # --- Help Menu ---
         help_menu = menubar.addMenu("Help")
         
@@ -824,6 +819,647 @@ class OCRScanner(QMainWindow):
         self.update_banner = QFrame()
         self.update_banner.setObjectName("UpdateBanner")
         self.update_banner.setStyleSheet("""
+            #UpdateBanner { background-color: #005A9E; border-bottom: 1px solid #004578; }
+            QLabel { color: white; font-weight: bold; padding: 4px; }
+            QPushButton { background-color: white; color: #005A9E; border: none; border-radius: 3px; padding: 4px 12px; font-weight: bold; }
+            QPushButton:hover { background-color: #E1DFDD; }
+            QPushButton:disabled { color: gray; }
+        """)
+        self.update_banner.setVisible(False)
+        banner_layout = QHBoxLayout(self.update_banner)
+        banner_layout.setContentsMargins(12, 4, 12, 4)
+        
+        self.update_label = QLabel("")
+        self.update_btn = QPushButton("")
+        
+        banner_layout.addWidget(self.update_label)
+        banner_layout.addStretch()
+        banner_layout.addWidget(self.update_btn)
+        
+        root_layout.addWidget(self.update_banner)
+
+        main_layout = QHBoxLayout()
+        main_layout.setContentsMargins(9, 9, 9, 9)
+        root_layout.addLayout(main_layout, stretch=1)
+
+        # --- Right panel: live camera feed + capture button ---
+        self.video_label = VideoLabel(self)
+        self.video_label.setText("Camera Feed")
+        self.video_label.setMinimumSize(640, 480)
+        self.video_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+
+        self.capture_button = QPushButton("Capture & OCR")
+        self.capture_button.setMinimumHeight(50)
+        self.capture_button.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.capture_button.setStyleSheet("font-size: 16px; font-weight: bold;")
+        self.capture_button.clicked.connect(self.capture_and_ocr)
+
+        right_layout = QVBoxLayout()
+        right_layout.addWidget(self.video_label, stretch=1)
+        
+        # Center the capture button
+        capture_row = QHBoxLayout()
+        capture_row.addStretch()
+        capture_row.addWidget(self.capture_button, stretch=1)
+        capture_row.addStretch()
+        
+        right_layout.addLayout(capture_row, stretch=0)
+
+        # --- Left panel: all controls/settings ---
+        left_layout = QVBoxLayout()
+
+        # Camera selector
+        cam_row = QHBoxLayout()
+        cam_row.addWidget(QLabel("Camera:"))
+        self.camera_selector = QComboBox()
+        self.camera_selector.currentIndexChanged.connect(self.change_camera)
+        cam_row.addWidget(self.camera_selector)
+        left_layout.addLayout(cam_row)
+
+        # Resolution selector
+        res_row = QHBoxLayout()
+        res_row.addWidget(QLabel("Resolution:"))
+        self.resolution_selector = QComboBox()
+        for label, w, h in self.resolutions:
+            self.resolution_selector.addItem(label, (w, h))
+        self.resolution_selector.currentIndexChanged.connect(self.change_resolution)
+        res_row.addWidget(self.resolution_selector)
+        left_layout.addLayout(res_row)
+
+        # FPS selector
+        fps_row = QHBoxLayout()
+        fps_row.addWidget(QLabel("FPS:"))
+        self.fps_selector = QComboBox()
+        for label, fps_val in self.fps_presets:
+            self.fps_selector.addItem(label, fps_val)
+        self.fps_selector.currentIndexChanged.connect(self.change_fps)
+        fps_row.addWidget(self.fps_selector)
+        left_layout.addLayout(fps_row)
+
+        # Region controls
+        region_layout = QHBoxLayout()
+        region_layout.addWidget(QLabel("Region: drag on feed"))
+        self.clear_region_btn = QPushButton("Clear region")
+        self.clear_region_btn.clicked.connect(self.video_label.clear_selection)
+        region_layout.addWidget(self.clear_region_btn)
+        left_layout.addLayout(region_layout)
+
+        # Camera settings controls (talking directly to the driver via OpenCV)
+        cam_group = QGroupBox("Camera settings")
+        cam_layout = QGridLayout()
+        # Numeric controls (all sliders now: brightness, contrast, gain, etc.)
+        for row, prop_tuple in enumerate(self.camera_props):
+            label_text, prop_id, key = prop_tuple[0], prop_tuple[1], prop_tuple[2]
+            lbl = QLabel(label_text)
+            if key in self.camera_slider_keys and len(prop_tuple) >= 5:
+                low, high = int(prop_tuple[3]), int(prop_tuple[4])
+                slider = QSlider(Qt.Orientation.Horizontal)
+                slider.setRange(low, high)
+                slider.setSingleStep(max(1, (high - low) // 100))
+                value_label = QLabel(str(low))
+                value_label.setMinimumWidth(48)
+
+                def make_slider_cb(pid, skey, val_lbl):
+                    def on_change(val):
+                        self.set_camera_property(pid, skey, float(val))
+                        val_lbl.setText(str(val))
+
+                    return on_change
+
+                slider.valueChanged.connect(make_slider_cb(prop_id, key, value_label))
+                cam_layout.addWidget(lbl, row, 0)
+                cam_layout.addWidget(slider, row, 1)
+                cam_layout.addWidget(value_label, row, 2)
+                self.camera_controls[key] = slider
+                self.camera_value_labels[key] = value_label
+            else:
+                spin = QDoubleSpinBox()
+                if len(prop_tuple) >= 5:
+                    spin.setRange(float(prop_tuple[3]), float(prop_tuple[4]))
+                else:
+                    spin.setRange(-10000.0, 10000.0)
+                spin.setDecimals(2)
+                spin.setSingleStep(1.0)
+                spin.valueChanged.connect(
+                    lambda val, pid=prop_id, skey=key: self.set_camera_property(
+                        pid, skey, val
+                    )
+                )
+                cam_layout.addWidget(lbl, row, 0)
+                cam_layout.addWidget(spin, row, 1)
+                self.camera_controls[key] = spin
+
+        # Toggle controls (auto exposure / auto white balance / auto focus / low-light)
+        toggle_row_start = len(self.camera_props)
+        for idx, (label_text, prop_id, key) in enumerate(self.camera_toggle_props):
+            if prop_id is None:
+                continue
+            chk = QCheckBox(label_text)
+            chk.stateChanged.connect(
+                lambda state, pid=prop_id, skey=key: self.set_camera_toggle_property(
+                    pid, skey, state == Qt.CheckState.Checked
+                )
+            )
+            cam_layout.addWidget(chk, toggle_row_start + idx, 0, 1, 3)
+            self.camera_toggle_controls[key] = chk
+
+        hint_row = toggle_row_start + len(self.camera_toggle_props)
+        hint = QLabel(
+            "Tip: Turn off \"Auto focus\" or \"Auto white balance\" "
+            "to use the manual Focus and White balance (K) values above."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray; font-size: 11px;")
+        cam_layout.addWidget(hint, hint_row, 0, 1, 3)
+
+        reset_btn = QPushButton("Reset camera settings to defaults")
+        reset_btn.clicked.connect(self.reset_camera_settings)
+        cam_layout.addWidget(reset_btn, hint_row + 1, 0, 1, 3)
+
+        cam_group.setLayout(cam_layout)
+        left_layout.addWidget(cam_group)
+
+        # Flip controls for camera orientation
+        transform_layout = QHBoxLayout()
+        self.flip_horizontal_checkbox = QCheckBox("Flip horizontally")
+        self.flip_vertical_checkbox = QCheckBox("Flip vertically")
+        transform_layout.addWidget(self.flip_horizontal_checkbox)
+        transform_layout.addWidget(self.flip_vertical_checkbox)
+        left_layout.addLayout(transform_layout)
+
+        # File path row: input + browse
+        path_layout = QHBoxLayout()
+        self.path_label = QLabel("Save to:")
+        path_layout.addWidget(self.path_label)
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText(
+            "Select a file to save or append CSV data..."
+        )
+        path_layout.addWidget(self.path_edit)
+        self.browse_button = QPushButton("Browse...")
+        self.browse_button.clicked.connect(self.browse_save_path)
+        path_layout.addWidget(self.browse_button)
+        left_layout.addLayout(path_layout)
+
+        self.append_checkbox = QCheckBox("Append to existing file")
+        self.append_checkbox.setChecked(True)
+        left_layout.addWidget(self.append_checkbox)
+
+        left_layout.addStretch(1)
+
+        # ── Far-right column: History (top) + inline Review form (bottom) ──
+        far_right_layout = QVBoxLayout()
+        far_right_layout.setSpacing(6)
+
+        # ── History panel ──
+        history_group = QGroupBox("Scan History")
+        history_group.setMinimumWidth(260)
+        history_group.setMaximumWidth(360)
+        history_v = QVBoxLayout(history_group)
+
+        self.history_list = QListWidget()
+        self.history_list.setAlternatingRowColors(True)
+        self.history_list.setWordWrap(True)
+        self.history_list.setToolTip("Click a row to select, then use Edit / Delete")
+        self.history_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        history_v.addWidget(self.history_list, stretch=1)
+
+        hist_btn_row = QHBoxLayout()
+        self.hist_edit_btn = QPushButton("✏ Edit")
+        self.hist_edit_btn.setEnabled(False)
+        self.hist_edit_btn.clicked.connect(self._history_edit_row)
+        self.hist_delete_btn = QPushButton("🗑 Delete")
+        self.hist_delete_btn.setEnabled(False)
+        self.hist_delete_btn.clicked.connect(self._history_delete_row)
+        clear_hist_btn = QPushButton("Clear View")
+        clear_hist_btn.clicked.connect(self._clear_history)
+        hist_btn_row.addWidget(self.hist_edit_btn)
+        hist_btn_row.addWidget(self.hist_delete_btn)
+        hist_btn_row.addWidget(clear_hist_btn)
+        history_v.addLayout(hist_btn_row)
+
+        # Enable/disable edit+delete when selection changes
+        self.history_list.itemSelectionChanged.connect(self._on_history_selection_changed)
+
+        far_right_layout.addWidget(history_group, stretch=1)
+
+        # ── Inline Review / Edit panel ──
+        self.review_group = QGroupBox("Review & Edit")
+        self.review_group.setVisible(False)  # hidden until a scan lands or Edit pressed
+        review_v = QVBoxLayout(self.review_group)
+
+        self._review_status_label = QLabel("Edit fields below, then save.")
+        self._review_status_label.setWordWrap(True)
+        review_v.addWidget(self._review_status_label)
+
+        review_scroll = QScrollArea()
+        review_scroll.setWidgetResizable(True)
+        review_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        review_scroll.setMaximumHeight(220)
+        self._review_form_widget = QWidget()
+        self._review_form_layout = QFormLayout(self._review_form_widget)
+        self._review_form_layout.setContentsMargins(4, 4, 4, 4)
+        review_scroll.setWidget(self._review_form_widget)
+        review_v.addWidget(review_scroll)
+
+        review_btn_row = QHBoxLayout()
+        self._review_save_btn = QPushButton("💾 Save")
+        self._review_save_btn.clicked.connect(self._review_save)
+        self._review_cancel_btn = QPushButton("Cancel")
+        self._review_cancel_btn.clicked.connect(self._review_cancel)
+        review_btn_row.addWidget(self._review_save_btn)
+        review_btn_row.addWidget(self._review_cancel_btn)
+        review_v.addLayout(review_btn_row)
+
+        far_right_layout.addWidget(self.review_group, stretch=0)
+
+        # Track review state: None = new scan, int = editing row index in CSV
+        self._review_editing_csv_row = None  # None → append; int → overwrite that row
+        self._review_edits = []  # list of QLineEdit refs in the review form
+
+        # Add all three panels to main layout
+        main_layout.addLayout(left_layout, stretch=0)
+        main_layout.addLayout(right_layout, stretch=1)
+        main_layout.addLayout(far_right_layout, stretch=0)
+
+    def detect_cameras(self):
+        self.camera_selector.clear()
+        index = 0
+        while True:
+            cap = open_camera(index)
+            if not cap.isOpened() or not cap.read()[0]:
+                cap.release()
+                break
+            self.camera_selector.addItem(f"Camera {index}", index)
+            cap.release()
+            index += 1
+
+        if self.camera_selector.count() > 0:
+            # Default to first camera; load_settings() may override with saved index
+            self.change_camera(0)
+
+    def load_settings(self):
+        """Restore saved camera index, orientation, and file path."""
+        saved_camera = self.settings.value("cameraIndex", 0, type=int)
+        for i in range(self.camera_selector.count()):
+            if self.camera_selector.itemData(i) == saved_camera:
+                self.camera_selector.blockSignals(True)
+                self.camera_selector.setCurrentIndex(i)
+                self.camera_selector.blockSignals(False)
+                self.change_camera(i)
+                break
+
+        self.flip_horizontal_checkbox.setChecked(
+            self.settings.value("flipHorizontal", False, type=bool)
+        )
+        self.flip_vertical_checkbox.setChecked(
+            self.settings.value("flipVertical", False, type=bool)
+        )
+        self.path_edit.setText(self.settings.value("saveFilePath", "", type=str))
+        self.append_checkbox.setChecked(
+            self.settings.value("appendToExisting", True, type=bool)
+        )
+        # Restore capture region if saved
+        snx = self.settings.value("selectionNormX", None)
+        sny = self.settings.value("selectionNormY", None)
+        snw = self.settings.value("selectionNormW", None)
+        snh = self.settings.value("selectionNormH", None)
+        if snx is not None and sny is not None and snw is not None and snh is not None:
+            try:
+                self.video_label.set_selection_normalized(
+                    float(snx), float(sny), float(snw), float(snh)
+                )
+            except (TypeError, ValueError):
+                pass
+        # Populate history panel from the saved CSV (if any)
+        self.refresh_history()
+
+    def save_settings(self):
+        """Persist camera index, orientation, and file path."""
+        if self.camera_selector.count() > 0:
+            self.settings.setValue(
+                "cameraIndex",
+                self.camera_selector.currentData(),
+            )
+        self.settings.setValue(
+            "flipHorizontal",
+            self.flip_horizontal_checkbox.isChecked(),
+        )
+        self.settings.setValue(
+            "flipVertical",
+            self.flip_vertical_checkbox.isChecked(),
+        )
+        self.settings.setValue("saveFilePath", self.path_edit.text().strip())
+        self.settings.setValue(
+            "appendToExisting",
+            self.append_checkbox.isChecked(),
+        )
+        norm = self.video_label.get_selection_normalized()
+        if norm is not None:
+            self.settings.setValue("selectionNormX", norm[0])
+            self.settings.setValue("selectionNormY", norm[1])
+            self.settings.setValue("selectionNormW", norm[2])
+            self.settings.setValue("selectionNormH", norm[3])
+        else:
+            self.settings.remove("selectionNormX")
+            self.settings.remove("selectionNormY")
+            self.settings.remove("selectionNormW")
+            self.settings.remove("selectionNormH")
+        self.settings.sync()
+
+    def load_camera_properties_for_current(self):
+        """Load per-camera driver properties (exposure, contrast, etc.) into UI and device."""
+        if not self.video_capture or not self.video_capture.isOpened():
+            return
+        camera_index = self.camera_selector.currentData()
+        if camera_index is None:
+            return
+        # Numeric properties
+        for prop_tuple in self.camera_props:
+            _, prop_id, key = prop_tuple[0], prop_tuple[1], prop_tuple[2]
+            spin = self.camera_controls.get(key)
+            if spin is None:
+                continue
+            setting_key = f"camera/{camera_index}/{key}"
+            saved = self.settings.value(setting_key, None)
+            if saved is not None:
+                try:
+                    val = float(saved)
+                except (TypeError, ValueError):
+                    val = self.video_capture.get(prop_id)
+                # Apply saved value to device
+                if val is not None:
+                    self.video_capture.set(prop_id, float(val))
+            else:
+                val = self.video_capture.get(prop_id)
+            if val is None:
+                continue
+            ctrl = self.camera_controls.get(key)
+            if ctrl is None:
+                continue
+            ctrl.blockSignals(True)
+            if key in self.camera_slider_keys:
+                ival = int(round(val))
+                ctrl.setValue(ival)
+                vlbl = self.camera_value_labels.get(key)
+                if vlbl is not None:
+                    vlbl.setText(str(ival))
+            else:
+                ctrl.setValue(val)
+            ctrl.blockSignals(False)
+
+        # Toggle properties (auto exposure / WB / focus)
+        for _, prop_id, key in self.camera_toggle_props:
+            chk = self.camera_toggle_controls.get(key)
+            if chk is None or prop_id is None:
+                continue
+            setting_key = f"camera/{camera_index}/{key}"
+            saved = self.settings.value(setting_key, None)
+            if saved is not None:
+                try:
+                    val = float(saved)
+                except (TypeError, ValueError):
+                    val = self.video_capture.get(prop_id)
+                if val is not None:
+                    self.video_capture.set(prop_id, float(val))
+            else:
+                val = self.video_capture.get(prop_id)
+            if val is None:
+                continue
+            checked = bool(val >= 0.5)
+            chk.blockSignals(True)
+            chk.setChecked(checked)
+            chk.blockSignals(False)
+
+    def load_resolution_for_current(self):
+        """Apply saved resolution for the currently selected camera (and update dropdown)."""
+        if self.camera_selector.count() == 0 or self.resolution_selector.count() == 0:
+            return
+        camera_index = self.camera_selector.currentData()
+        if camera_index is None:
+            return
+        saved_index = self.settings.value(
+            f"camera/{camera_index}/resolutionIndex", 0, type=int
+        )
+        if saved_index < 0 or saved_index >= self.resolution_selector.count():
+            saved_index = 0
+        self.resolution_selector.blockSignals(True)
+        self.resolution_selector.setCurrentIndex(saved_index)
+        self.resolution_selector.blockSignals(False)
+        self.change_resolution(saved_index)
+
+    def load_fps_for_current(self):
+        """Apply saved FPS for the current camera and sync timer."""
+        if self.camera_selector.count() == 0 or self.fps_selector.count() == 0:
+            return
+        camera_index = self.camera_selector.currentData()
+        if camera_index is None:
+            return
+        saved_index = self.settings.value(
+            f"camera/{camera_index}/fpsIndex", 2, type=int
+        )  # default 30 fps (index 2)
+        if saved_index < 0 or saved_index >= self.fps_selector.count():
+            saved_index = 2
+        self.fps_selector.blockSignals(True)
+        self.fps_selector.setCurrentIndex(saved_index)
+        self.fps_selector.blockSignals(False)
+        self._apply_fps_and_timer(self.fps_selector.currentData())
+
+    def _apply_fps_and_timer(self, fps_value):
+        """Set camera FPS and timer interval from FPS value."""
+        if fps_value is None or fps_value <= 0:
+            fps_value = 30
+        if self.video_capture and self.video_capture.isOpened():
+            self.video_capture.set(cv2.CAP_PROP_FPS, int(fps_value))
+        interval_ms = max(5, min(100, int(1000 / fps_value)))
+        self.timer.setInterval(interval_ms)
+
+    def change_fps(self, index):
+        """Change capture FPS and timer interval."""
+        if index < 0 or self.fps_selector.count() == 0:
+            return
+        fps_value = self.fps_selector.itemData(index)
+        if fps_value is None:
+            return
+        self._apply_fps_and_timer(fps_value)
+        camera_index = self.camera_selector.currentData()
+        if camera_index is not None:
+            self.settings.setValue(f"camera/{camera_index}/fpsIndex", int(index))
+            self.settings.sync()
+
+    def set_camera_property(self, prop_id, key, value):
+        """Apply a camera driver property via OpenCV and persist it per camera."""
+        if self.video_capture and self.video_capture.isOpened():
+            self.video_capture.set(prop_id, float(value))
+        camera_index = self.camera_selector.currentData()
+        if camera_index is not None:
+            setting_key = f"camera/{camera_index}/{key}"
+            self.settings.setValue(setting_key, float(value))
+            self.settings.sync()
+
+    def set_camera_toggle_property(self, prop_id, key, enabled):
+        """Apply a boolean-ish camera property and persist it per camera."""
+        val = 1.0 if enabled else 0.0
+        if self.video_capture and self.video_capture.isOpened():
+            self.video_capture.set(prop_id, val)
+        camera_index = self.camera_selector.currentData()
+        if camera_index is not None:
+            setting_key = f"camera/{camera_index}/{key}"
+            self.settings.setValue(setting_key, val)
+            self.settings.sync()
+
+    def change_resolution(self, index):
+        """Change capture resolution based on dropdown selection."""
+        if index < 0 or self.resolution_selector.count() == 0:
+            return
+        data = self.resolution_selector.itemData(index)
+        if not data:
+            return
+        width, height = data
+        if self.video_capture and self.video_capture.isOpened():
+            self.video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+            self.video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+        camera_index = self.camera_selector.currentData()
+        if camera_index is not None:
+            self.settings.setValue(
+                f"camera/{camera_index}/resolutionIndex", int(index)
+            )
+            self.settings.sync()
+
+    def reset_camera_settings(self):
+        """Reset all camera settings to defaults and apply to device."""
+        if not self.video_capture or not self.video_capture.isOpened():
+            QMessageBox.information(
+                self, "Reset",
+                "No camera open. Select a camera first."
+            )
+            return
+        camera_index = self.camera_selector.currentData()
+        if camera_index is None:
+            return
+        for prop_tuple in self.camera_props:
+            _, prop_id, key = prop_tuple[0], prop_tuple[1], prop_tuple[2]
+            default = self.camera_defaults.get(key)
+            if default is None:
+                continue
+            val = float(default) if key not in self.camera_slider_keys else int(default)
+            self.video_capture.set(prop_id, val)
+            ctrl = self.camera_controls.get(key)
+            if ctrl is not None:
+                ctrl.blockSignals(True)
+                if key in self.camera_slider_keys:
+                    ctrl.setValue(int(round(val)))
+                    vlbl = self.camera_value_labels.get(key)
+                    if vlbl is not None:
+                        vlbl.setText(str(int(round(val))))
+                else:
+                    ctrl.setValue(val)
+                ctrl.blockSignals(False)
+            self.settings.setValue(f"camera/{camera_index}/{key}", val)
+        for _, prop_id, key in self.camera_toggle_props:
+            if prop_id is None:
+                continue
+            default = self.camera_defaults.get(key, 1.0)
+            val = float(default)
+            self.video_capture.set(prop_id, val)
+            chk = self.camera_toggle_controls.get(key)
+            if chk is not None:
+                chk.blockSignals(True)
+                chk.setChecked(bool(val >= 0.5))
+                chk.blockSignals(False)
+            self.settings.setValue(f"camera/{camera_index}/{key}", val)
+        self.settings.sync()
+        QMessageBox.information(self, "Reset", "Camera settings reset to defaults.")
+
+    def change_camera(self, index):
+        if self.video_capture:
+            self.timer.stop()
+            self.video_capture.release()
+            self.video_capture = None
+
+        camera_index = self.camera_selector.itemData(index)
+        self.video_capture = open_camera(camera_index)
+        if not self.video_capture.isOpened():
+            self.video_capture = None
+            QMessageBox.warning(
+                self, "Camera error",
+                "Could not open the selected camera. Try another camera index."
+            )
+            return
+        # Apply saved resolution, FPS, and sync UI controls with this camera's driver settings
+        self.load_resolution_for_current()
+        self.load_fps_for_current()
+        self.load_camera_properties_for_current()
+        self.timer.start()
+
+    def update_frame(self):
+        if self.video_capture is None or not self.video_capture.isOpened():
+            return
+        # Drop stale frames so we always show the latest (reduces lag and stutter)
+        for _ in range(4):
+            if not self.video_capture.grab():
+                break
+        ret, frame = self.video_capture.retrieve()
+        if not ret or frame is None:
+            return
+        processed_frame = self.apply_transformations(frame)
+        self.current_frame = processed_frame
+        self.video_label.update_frame(processed_frame)
+
+    def apply_transformations(self, frame):
+        """Apply orientation adjustments (flip horizontally/vertically)."""
+        flip_h = self.flip_horizontal_checkbox.isChecked()
+        flip_v = self.flip_vertical_checkbox.isChecked()
+
+        if flip_h and flip_v:
+            # Flip both horizontally and vertically
+            return cv2.flip(frame, -1)
+        elif flip_h:
+            return cv2.flip(frame, 1)
+        elif flip_v:
+            return cv2.flip(frame, 0)
+        return frame
+
+    def preprocess_image(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        thresh = cv2.adaptiveThreshold(
+            blur, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 11, 2
+        )
+        return thresh
+
+    def capture_and_ocr(self):
+        if self.current_frame is None:
+            QMessageBox.warning(self, "Error", "No frame captured.")
+            return
+
+        frame = self.current_frame
+        sel = self.video_label.get_selection()
+        if sel is not None:
+            x, y, w, h = sel
+            frame = frame[y : y + h, x : x + w]
+
+        processed = self.preprocess_image(frame)
+        pil_image = Image.fromarray(processed)
+
+        text = pytesseract.image_to_string(pil_image)
+
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+
+        if len(lines) == 0:
+            QMessageBox.information(self, "No Text Found", "OCR did not detect text.")
+            return
+
+        # Limit to first 5 lines
+        lines = lines[:5]
+
+        # Sanitize last line to numeric only
         last = lines[-1]
         numeric_only = re.sub(r"[^0-9.\-]", "", last)
         lines[-1] = numeric_only if numeric_only else last
@@ -1101,12 +1737,6 @@ class OCRScanner(QMainWindow):
                         self.capture_and_ocr()
                         return True
         return super().eventFilter(obj, event)
-
-    def _manual_entry(self):
-        """Open the review panel with empty fields for manual data entry."""
-        self._review_editing_csv_row = None
-        # Default to 5 empty fields
-        self._review_populate(["", "", "", "", ""], status="Manual Entry — enter details, then save.")
 
 
 if __name__ == "__main__":
