@@ -2,6 +2,14 @@ import sys
 import platform
 import cv2
 import csv
+import json
+import shutil
+import tempfile
+import urllib.request
+import urllib.error
+import subprocess
+from pathlib import Path
+
 import pytesseract
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
@@ -9,13 +17,28 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QGroupBox,
     QFileDialog, QMessageBox, QComboBox,
     QLineEdit, QCheckBox, QDoubleSpinBox, QSlider,
-    QSizePolicy, QDialog, QDialogButtonBox,
-    QFormLayout, QScrollArea
+    QSizePolicy, QFormLayout, QScrollArea,
+    QListWidget, QListWidgetItem, QFrame, QCompleter,
+    QDialog, QColorDialog, QFontComboBox, QDialogButtonBox,
+    QColorDialog
 )
-from PyQt6.QtCore import QTimer, Qt, QSettings, QRect, QPoint
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QMouseEvent
+from PyQt6.QtCore import QTimer, Qt, QSettings, QRect, QPoint, QRegularExpression, QThread, pyqtSignal
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QMouseEvent, QRegularExpressionValidator, QFont
 from PIL import Image
 import numpy as np
+
+try:
+    from version import (
+        APP_NAME, APP_VERSION, UPDATER_EXE,
+        RELEASES_API_URL, is_newer, is_major_bump, parse_version
+    )
+except ImportError:
+    APP_NAME = "Claims Scanner"
+    APP_VERSION = "0.0.1"
+    UPDATER_EXE = "argus_updater.exe"
+    RELEASES_API_URL = ""
+    is_newer = lambda x: False
+    is_major_bump = lambda x: False
 
 # Uncomment and adjust path if needed (Windows)
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -230,55 +253,242 @@ class VideoLabel(QLabel):
 import re
 
 
-class OCREditDialog(QDialog):
-    """Dialog that shows one editable QLineEdit per OCR-scanned field."""
+# OCREditDialog removed — review is now an inline panel inside OCRScanner.
 
-    def __init__(self, lines, parent=None):
+
+class UpdateCheckerThread(QThread):
+    """Checks GitHub Releases in the background for a newer version."""
+    update_available = pyqtSignal(dict)  # Emits the release info dict
+
+    def run(self):
+        if not RELEASES_API_URL: return
+        try:
+            req = urllib.request.Request(
+                RELEASES_API_URL,
+                headers={"User-Agent": f"ProjectArgus/{APP_VERSION}",
+                         "Accept": "application/vnd.github+json"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            
+            latest_tag = data.get("tag_name", "")
+            if is_newer(latest_tag):
+                self.update_available.emit(data)
+        except Exception as e:
+            # Silently fail on network errors
+            pass
+
+
+class DownloaderThread(QThread):
+    """Downloads a file in the background."""
+    progress = pyqtSignal(int)
+    done = pyqtSignal(str)
+    error = pyqtSignal(str)
+    
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+        
+    def run(self):
+        try:
+            req = urllib.request.Request(
+                self.url,
+                headers={"User-Agent": f"ProjectArgus/{APP_VERSION}"}
+            )
+            tmp = tempfile.mktemp(suffix=".exe")
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                total = int(resp.headers.get("Content-Length", 0))
+                downloaded = 0
+                chunk_size = 65536
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = resp.read(chunk_size)
+                        if not chunk: break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            self.progress.emit(min(99, int(downloaded * 100 / total)))
+            self.progress.emit(100)
+            self.done.emit(tmp)
+        except Exception as e:
+            self.error.emit(str(e))
+
+class PreferencesDialog(QDialog):
+    def __init__(self, parent=None, settings=None):
         super().__init__(parent)
-        self.setWindowTitle("Review & Edit Scanned Data")
-        self.setMinimumWidth(420)
-
+        self.setWindowTitle("Preferences")
+        self.setMinimumWidth(450)
+        self.settings = settings
+        
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Edit the scanned values below before saving:"))
+        
+        # 1. Hospital List File Selector
+        file_group = QGroupBox("Hospital List Configuration")
+        flayout = QHBoxLayout()
+        self.hospital_path_edit = QLineEdit()
+        self.hospital_path_edit.setText(self.settings.value("hospitalListPath", "hospital_list.txt"))
+        btn_browse = QPushButton("Browse...")
+        btn_browse.clicked.connect(self._browse_hospital_file)
+        flayout.addWidget(QLabel("File Path:"))
+        flayout.addWidget(self.hospital_path_edit)
+        flayout.addWidget(btn_browse)
+        file_group.setLayout(flayout)
+        layout.addWidget(file_group)
+        
+        # 2. Last Saved Facility
+        last_group = QGroupBox("Scan Behavior")
+        llayout = QVBoxLayout()
+        self.remember_facility_cb = QCheckBox("Remember last saved facility")
+        self.remember_facility_cb.setChecked(self.settings.value("rememberFacility", False, type=bool))
+        llayout.addWidget(self.remember_facility_cb)
+        last_group.setLayout(llayout)
+        layout.addWidget(last_group)
+        
+        # 3. Theming Options
+        theme_group = QGroupBox("Theming")
+        tlayout = QGridLayout()
+        
+        self.bg_color = self.settings.value("appBgColor", "#f0f0f0")
+        self.text_color = self.settings.value("textColor", "#000000")
+        self.input_bg_color = self.settings.value("inputBgColor", "#ffffff")
+        self.hover_color = self.settings.value("hoverColor", "#dddddd")
+        self.alt_row_color = self.settings.value("altRowColor", "#e6e6e6")
+        self.font_family = self.settings.value("fontFamily", "Segoe UI")
+        
+        self.btn_bg = QPushButton(self.bg_color)
+        self.btn_bg.setStyleSheet(f"background-color: {self.bg_color}; color: #000; border: 1px solid gray;")
+        self.btn_bg.clicked.connect(lambda: self._pick_color("bg_color", self.btn_bg))
+        
+        self.btn_text = QPushButton(self.text_color)
+        self.btn_text.setStyleSheet(f"background-color: {self.text_color}; color: #fff; border: 1px solid gray;")
+        self.btn_text.clicked.connect(lambda: self._pick_color("text_color", self.btn_text))
+        
+        self.btn_input = QPushButton(self.input_bg_color)
+        self.btn_input.setStyleSheet(f"background-color: {self.input_bg_color}; color: #000; border: 1px solid gray;")
+        self.btn_input.clicked.connect(lambda: self._pick_color("input_bg_color", self.btn_input))
+        
+        self.btn_hover = QPushButton(self.hover_color)
+        self.btn_hover.setStyleSheet(f"background-color: {self.hover_color}; color: #000; border: 1px solid gray;")
+        self.btn_hover.clicked.connect(lambda: self._pick_color("hover_color", self.btn_hover))
 
-        # Scroll area in case there are many fields
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        form_widget = QWidget()
-        form_layout = QFormLayout(form_widget)
-        form_layout.setContentsMargins(0, 0, 0, 0)
+        self.btn_alt_row = QPushButton(self.alt_row_color)
+        self.btn_alt_row.setStyleSheet(f"background-color: {self.alt_row_color}; color: #000; border: 1px solid gray;")
+        self.btn_alt_row.clicked.connect(lambda: self._pick_color("alt_row_color", self.btn_alt_row))
+        
+        self.font_combo = QFontComboBox()
+        self.font_combo.setCurrentFont(QFont(self.font_family))
+        
+        tlayout.addWidget(QLabel("Background Color:"), 0, 0)
+        tlayout.addWidget(self.btn_bg, 0, 1)
+        
+        tlayout.addWidget(QLabel("Text Color:"), 1, 0)
+        tlayout.addWidget(self.btn_text, 1, 1)
+        
+        tlayout.addWidget(QLabel("Input Field BG Color:"), 2, 0)
+        tlayout.addWidget(self.btn_input, 2, 1)
+        
+        tlayout.addWidget(QLabel("Button Hover Color:"), 3, 0)
+        tlayout.addWidget(self.btn_hover, 3, 1)
 
-        self._edits = []
-        for i, line in enumerate(lines):
-            field_label = f"Field {i + 1}:"
-            edit = QLineEdit(line)
-            edit.setMinimumWidth(300)
-            form_layout.addRow(field_label, edit)
-            self._edits.append(edit)
+        tlayout.addWidget(QLabel("Alternate Row Color:"), 4, 0)
+        tlayout.addWidget(self.btn_alt_row, 4, 1)
 
-        scroll.setWidget(form_widget)
-        layout.addWidget(scroll)
+        tlayout.addWidget(QLabel("Font Family:"), 5, 0)
+        tlayout.addWidget(self.font_combo, 5, 1)
+        
+        # Export/Import buttons
+        th_btns = QHBoxLayout()
+        btn_export = QPushButton("Export Theme")
+        btn_export.clicked.connect(self._export_theme)
+        btn_import = QPushButton("Import Theme")
+        btn_import.clicked.connect(self._import_theme)
+        th_btns.addWidget(btn_import)
+        th_btns.addWidget(btn_export)
+        tlayout.addLayout(th_btns, 6, 0, 1, 2)
+        
+        theme_group.setLayout(tlayout)
+        layout.addWidget(theme_group)
+        
+        # Buttons
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+    def _browse_hospital_file(self):
+        filename, _ = QFileDialog.getOpenFileName(self, "Select Hospital List File", "", "Text Files (*.txt);;All Files (*)")
+        if filename:
+            self.hospital_path_edit.setText(filename)
+            
+    def _pick_color(self, attr_name, btn):
+        current_color = getattr(self, attr_name)
+        color = QColorDialog.getColor(QColor(current_color), self, "Select Color")
+        if color.isValid():
+            hex_color = color.name()
+            setattr(self, attr_name, hex_color)
+            btn.setText(hex_color)
+            # Invert text so it's readable
+            fg = "#fff" if color.lightness() < 128 else "#000"
+            btn.setStyleSheet(f"background-color: {hex_color}; color: {fg}; border: 1px solid gray;")
 
-        # Standard OK / Cancel buttons
-        btn_box = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save
-            | QDialogButtonBox.StandardButton.Cancel
-        )
-        btn_box.accepted.connect(self.accept)
-        btn_box.rejected.connect(self.reject)
-        layout.addWidget(btn_box)
-
-    def get_values(self):
-        """Return the (possibly edited) list of field strings."""
-        return [edit.text() for edit in self._edits]
+    def _export_theme(self):
+        filename, _ = QFileDialog.getSaveFileName(self, "Export Theme", "", "JSON Files (*.json)")
+        if filename:
+            theme_data = {
+                "appBgColor": self.bg_color,
+                "textColor": self.text_color,
+                "inputBgColor": self.input_bg_color,
+                "hoverColor": self.hover_color,
+                "altRowColor": self.alt_row_color,
+                "fontFamily": self.font_combo.currentFont().family()
+            }
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    json.dump(theme_data, f, indent=4)
+                QMessageBox.information(self, "Themes", "Theme exported successfully!")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", str(e))
+                
+    def _import_theme(self):
+        filename, _ = QFileDialog.getOpenFileName(self, "Import Theme", "", "JSON Files (*.json)")
+        if filename:
+            try:
+                with open(filename, 'r', encoding='utf-8') as f:
+                    theme_data = json.load(f)
+                
+                self.bg_color = theme_data.get("appBgColor", self.bg_color)
+                self.text_color = theme_data.get("textColor", self.text_color)
+                self.input_bg_color = theme_data.get("inputBgColor", self.input_bg_color)
+                self.hover_color = theme_data.get("hoverColor", self.hover_color)
+                self.alt_row_color = theme_data.get("altRowColor", self.alt_row_color)
+                font_fam = theme_data.get("fontFamily", "Segoe UI")
+                
+                # Update UI elements
+                self.btn_bg.setText(self.bg_color)
+                self.btn_text.setText(self.text_color)
+                self.btn_input.setText(self.input_bg_color)
+                self.btn_hover.setText(self.hover_color)
+                self.btn_alt_row.setText(self.alt_row_color)
+                self.font_combo.setCurrentFont(QFont(font_fam))
+                
+                for attr, btn in [("bg_color", self.btn_bg), ("text_color", self.btn_text), 
+                                  ("input_bg_color", self.btn_input), ("hover_color", self.btn_hover), 
+                                  ("alt_row_color", self.btn_alt_row)]:
+                    c = QColor(getattr(self, attr))
+                    fg = "#fff" if c.lightness() < 128 else "#000"
+                    btn.setStyleSheet(f"background-color: {c.name()}; color: {fg}; border: 1px solid gray;")
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Import Error", str(e))
 
 
 class OCRScanner(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Claims Scanner v0.0.1")
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.setGeometry(100, 100, 800, 600)
+
+        self._create_menu()
 
         self.video_capture = None
         self.current_frame = None
@@ -286,6 +496,13 @@ class OCRScanner(QMainWindow):
         self.timer.timeout.connect(self.update_frame)
 
         self.extracted_data = []  # Stores all scanned entries
+        
+        self.settings = QSettings("ProjectArgus", "ClaimsScanner")
+        self.last_saved_facility = self.settings.value("lastSavedFacility", "")
+        
+        self.hospital_list = []
+        self.load_hospital_list()
+
         # Camera property definitions: (label, OpenCV property id, settings key) or + (min, max) for range
         self.camera_props = [
             ("Brightness", cv2.CAP_PROP_BRIGHTNESS, "brightness", 0, 255),
@@ -371,569 +588,417 @@ class OCRScanner(QMainWindow):
             )
         # key -> checkbox (toggle controls)
         self.camera_toggle_controls = {}
-        self.settings = QSettings("ProjectArgus", "ClaimsScanner")
-
+        
+        # We already initialized self.settings above
         self.init_ui()
         self.detect_cameras()
         self.load_settings()
+        self.apply_theme()
+        
+        # Install global event filter to catch Enter/Return key globally
+        QApplication.instance().installEventFilter(self)
+        
+        # Check for updates 5 seconds after launch
+        QTimer.singleShot(5000, self._check_update)
+
+    def load_hospital_list(self):
+        path = self.settings.value("hospitalListPath", "hospital_list.txt")
+        self.hospital_list = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self.hospital_list = [line.strip() for line in f if line.strip()]
+        except Exception as e:
+            print(f"Could not load hospital list from {path}: {e}")
+
+    def apply_theme(self):
+        bg_color = self.settings.value("appBgColor", "#f0f0f0")
+        text_color = self.settings.value("textColor", "#000000")
+        input_bg_color = self.settings.value("inputBgColor", "#ffffff")
+        hover_color = self.settings.value("hoverColor", "#dddddd")
+        alt_row_color = self.settings.value("altRowColor", "#e6e6e6")
+        font_family = self.settings.value("fontFamily", "Segoe UI")
+        
+        style = f"""
+        QMainWindow, QDialog, QWidget {{
+            background-color: {bg_color};
+            color: {text_color};
+            font-family: "{font_family}";
+        }}
+        QLineEdit, QComboBox, QDoubleSpinBox, QListWidget, QScrollArea {{
+            background-color: {input_bg_color};
+            color: {text_color};
+            border: 1px solid gray;
+        }}
+        QListWidget {{
+            alternate-background-color: {alt_row_color};
+        }}
+        QPushButton {{
+            background-color: {input_bg_color};
+            color: {text_color};
+            border: 1px solid gray;
+            padding: 4px;
+            border-radius: 2px;
+        }}
+        QPushButton:hover {{
+            background-color: {hover_color};
+        }}
+        QGroupBox {{
+            border: 1px solid gray;
+            margin-top: 1ex;
+        }}
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            padding: 0 3px;
+        }}
+        """
+        self.setStyleSheet(style)
+
+    def _check_update(self, manual=False):
+        if manual:
+            self.statusBar().showMessage("Checking for updates...")
+        self._update_checker = UpdateCheckerThread()
+        self._update_checker.update_available.connect(lambda data: self._on_update_available(data, manual))
+        self._update_checker.start()
+
+    def _on_update_available(self, data, manual=False):
+        tag = data.get("tag_name", "").lstrip("v")
+        self._latest_release_data = data
+        
+        if manual:
+            self.statusBar().showMessage("Update check complete.", 3000)
+            
+        # Switch button behavior based on major vs minor bump
+        try:
+            self.update_btn.clicked.disconnect()
+        except TypeError:
+            pass  # not connected yet
+            
+        if is_major_bump(tag):
+            self.update_label.setText(f"Major Update v{tag} Available  —  Cannot install in-place.")
+            self.update_btn.setText("Run Updater")
+            self.update_btn.clicked.connect(self._run_updater)
+        else:
+            self.update_label.setText(f"Update v{tag} Available  —  Bug fixes and improvements.")
+            self.update_btn.setText("Install Now")
+            self.update_btn.clicked.connect(self._install_minor_update)
+            
+        self.update_banner.setVisible(True)
+
+    def _create_menu(self):
+        menubar = self.menuBar()
+        
+        # --- File Menu ---
+        file_menu = menubar.addMenu("File")
+        
+        prefs_action = file_menu.addAction("Preferences...")
+        prefs_action.triggered.connect(self._show_preferences)
+        file_menu.addSeparator()
+        
+        exit_action = file_menu.addAction("Exit")
+        exit_action.triggered.connect(self.close)
+        
+        # --- Tools Menu ---
+        tools_menu = menubar.addMenu("Tools")
+        manual_entry_action = tools_menu.addAction("Manual Entry")
+        manual_entry_action.triggered.connect(self._manual_entry)
+        
+        # --- Help Menu ---
+        help_menu = menubar.addMenu("Help")
+        
+        docs_action = help_menu.addAction("Documentation")
+        docs_action.triggered.connect(self._show_documentation)
+        
+        check_updates_action = help_menu.addAction("Check for Updates")
+        check_updates_action.triggered.connect(lambda: self._check_update(manual=True))
+        
+        about_action = help_menu.addAction("About")
+        about_action.triggered.connect(self._show_about)
+
+    def _show_preferences(self):
+        dialog = PreferencesDialog(self, self.settings)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.settings.setValue("hospitalListPath", dialog.hospital_path_edit.text().strip())
+            self.settings.setValue("rememberFacility", dialog.remember_facility_cb.isChecked())
+            self.settings.setValue("appBgColor", dialog.bg_color)
+            self.settings.setValue("textColor", dialog.text_color)
+            self.settings.setValue("inputBgColor", dialog.input_bg_color)
+            self.settings.setValue("hoverColor", dialog.hover_color)
+            self.settings.setValue("altRowColor", dialog.alt_row_color)
+            self.settings.setValue("fontFamily", dialog.font_combo.currentFont().family())
+            
+            self.load_hospital_list()
+            self.apply_theme()
+
+    def _show_documentation(self):
+        QMessageBox.information(
+            self,
+            "Help / Documentation",
+            "<h3>PROJECT ARGUS Claims Scanner</h3>"
+            "<p><b>How to use:</b></p>"
+            "<ul>"
+            "<li>Select your camera, resolution, and FPS from the left panel.</li>"
+            "<li>Adjust brightness, contrast, and other settings if necessary.</li>"
+            "<li>Click and drag on the camera feed to draw a precise OCR region.</li>"
+            "<li>Click <b>Capture & OCR</b> to scan the document.</li>"
+            "<li>Scanned items appear in your history panel, where you can edit or delete them.</li>"
+            "<li>Data is continuously appended to your chosen CSV file.</li>"
+            "</ul>"
+        )
+
+    def _show_about(self):
+        QMessageBox.about(
+            self,
+            "About PROJECT ARGUS",
+            f"<h2>{APP_NAME}</h2>"
+            f"<p><b>Version:</b> {APP_VERSION}</p>"
+            "<p><b>Creator:</b> Lou</p>"
+            "<br/>"
+            "<p>A desktop OCR scanning tool built with PyQt6, OpenCV, and Tesseract. "
+            "Scan documents via webcam, extract text, and export to CSV seamlessly.</p>"
+        )
+
+    def _run_updater(self):
+        """Launch the standalone updater EXE and close this app."""
+        app_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+        updater = app_dir / UPDATER_EXE
+        if updater.exists():
+            subprocess.Popen([str(updater)], cwd=str(app_dir))
+            self.close()
+        else:
+            QMessageBox.warning(self, "Updater Not Found", f"Could not find {UPDATER_EXE}.")
+
+    def _install_minor_update(self):
+        """Download the main EXE replacement silently, then restart."""
+        url = None
+        for asset in self._latest_release_data.get("assets", []):
+            if asset.get("name", "").lower() == "claims_scanner.exe":
+                url = asset["browser_download_url"]
+                break
+        
+        if not url:
+            QMessageBox.warning(self, "Update Failed", "No executable asset found in the release.")
+            return
+            
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("Downloading...")
+        
+        self._downloader = DownloaderThread(url)
+        self._downloader.done.connect(self._on_minor_download_done)
+        self._downloader.error.connect(lambda e: QMessageBox.warning(self, "Download Error", str(e)))
+        self._downloader.start()
+
+    def _on_minor_download_done(self, tmp_path):
+        app_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+        target = app_dir / "claims_scanner.exe"
+        if target.exists():
+            try:
+                locked = app_dir / "claims_scanner.old"
+                target.rename(locked)
+            except Exception:
+                pass
+        
+        try:
+            shutil.move(tmp_path, str(target))
+            # Write new version.json
+            tag = self._latest_release_data.get("tag_name", "").lstrip("v")
+            (app_dir / "version.json").write_text(json.dumps({
+                "version": tag, "app_name": APP_NAME, "github_repo": GITHUB_REPO
+            }))
+            
+            QMessageBox.information(self, "Update Complete", "Update installed. The application will now restart.")
+            subprocess.Popen([str(target)], cwd=str(app_dir))
+            self.close()
+        except Exception as e:
+            QMessageBox.warning(self, "Install Error", f"Failed to install update: {e}")
+            self.update_btn.setEnabled(True)
+            self.update_btn.setText("Install Now")
 
     def init_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
 
-        main_layout = QHBoxLayout()
-        central_widget.setLayout(main_layout)
-
-        # --- Right panel: live camera feed + capture button ---
-        self.video_label = VideoLabel(self)
-        self.video_label.setText("Camera Feed")
-        self.video_label.setMinimumSize(640, 480)
-        self.video_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-
-        self.capture_button = QPushButton("Capture & OCR")
-        self.capture_button.clicked.connect(self.capture_and_ocr)
-
-        right_layout = QVBoxLayout()
-        right_layout.addWidget(self.video_label, stretch=1)
-        right_layout.addWidget(self.capture_button, stretch=0)
-        right_layout.setAlignment(self.capture_button, Qt.AlignmentFlag.AlignLeft)
-
-        # --- Left panel: all controls/settings ---
-        left_layout = QVBoxLayout()
-
-        # Camera selector
-        cam_row = QHBoxLayout()
-        cam_row.addWidget(QLabel("Camera:"))
-        self.camera_selector = QComboBox()
-        self.camera_selector.currentIndexChanged.connect(self.change_camera)
-        cam_row.addWidget(self.camera_selector)
-        left_layout.addLayout(cam_row)
-
-        # Resolution selector
-        res_row = QHBoxLayout()
-        res_row.addWidget(QLabel("Resolution:"))
-        self.resolution_selector = QComboBox()
-        for label, w, h in self.resolutions:
-            self.resolution_selector.addItem(label, (w, h))
-        self.resolution_selector.currentIndexChanged.connect(self.change_resolution)
-        res_row.addWidget(self.resolution_selector)
-        left_layout.addLayout(res_row)
-
-        # FPS selector
-        fps_row = QHBoxLayout()
-        fps_row.addWidget(QLabel("FPS:"))
-        self.fps_selector = QComboBox()
-        for label, fps_val in self.fps_presets:
-            self.fps_selector.addItem(label, fps_val)
-        self.fps_selector.currentIndexChanged.connect(self.change_fps)
-        fps_row.addWidget(self.fps_selector)
-        left_layout.addLayout(fps_row)
-
-        # Region controls
-        region_layout = QHBoxLayout()
-        region_layout.addWidget(QLabel("Region: drag on feed"))
-        self.clear_region_btn = QPushButton("Clear region")
-        self.clear_region_btn.clicked.connect(self.video_label.clear_selection)
-        region_layout.addWidget(self.clear_region_btn)
-        left_layout.addLayout(region_layout)
-
-        # Camera settings controls (talking directly to the driver via OpenCV)
-        cam_group = QGroupBox("Camera settings")
-        cam_layout = QGridLayout()
-        # Numeric controls (all sliders now: brightness, contrast, gain, etc.)
-        for row, prop_tuple in enumerate(self.camera_props):
-            label_text, prop_id, key = prop_tuple[0], prop_tuple[1], prop_tuple[2]
-            lbl = QLabel(label_text)
-            if key in self.camera_slider_keys and len(prop_tuple) >= 5:
-                low, high = int(prop_tuple[3]), int(prop_tuple[4])
-                slider = QSlider(Qt.Orientation.Horizontal)
-                slider.setRange(low, high)
-                slider.setSingleStep(max(1, (high - low) // 100))
-                value_label = QLabel(str(low))
-                value_label.setMinimumWidth(48)
-
-                def make_slider_cb(pid, skey, val_lbl):
-                    def on_change(val):
-                        self.set_camera_property(pid, skey, float(val))
-                        val_lbl.setText(str(val))
-
-                    return on_change
-
-                slider.valueChanged.connect(make_slider_cb(prop_id, key, value_label))
-                cam_layout.addWidget(lbl, row, 0)
-                cam_layout.addWidget(slider, row, 1)
-                cam_layout.addWidget(value_label, row, 2)
-                self.camera_controls[key] = slider
-                self.camera_value_labels[key] = value_label
-            else:
-                spin = QDoubleSpinBox()
-                if len(prop_tuple) >= 5:
-                    spin.setRange(float(prop_tuple[3]), float(prop_tuple[4]))
-                else:
-                    spin.setRange(-10000.0, 10000.0)
-                spin.setDecimals(2)
-                spin.setSingleStep(1.0)
-                spin.valueChanged.connect(
-                    lambda val, pid=prop_id, skey=key: self.set_camera_property(
-                        pid, skey, val
-                    )
-                )
-                cam_layout.addWidget(lbl, row, 0)
-                cam_layout.addWidget(spin, row, 1)
-                self.camera_controls[key] = spin
-
-        # Toggle controls (auto exposure / auto white balance / auto focus / low-light)
-        toggle_row_start = len(self.camera_props)
-        for idx, (label_text, prop_id, key) in enumerate(self.camera_toggle_props):
-            if prop_id is None:
-                continue
-            chk = QCheckBox(label_text)
-            chk.stateChanged.connect(
-                lambda state, pid=prop_id, skey=key: self.set_camera_toggle_property(
-                    pid, skey, state == Qt.CheckState.Checked
-                )
-            )
-            cam_layout.addWidget(chk, toggle_row_start + idx, 0, 1, 3)
-            self.camera_toggle_controls[key] = chk
-
-        hint_row = toggle_row_start + len(self.camera_toggle_props)
-        hint = QLabel(
-            "Tip: Turn off \"Auto focus\" or \"Auto white balance\" "
-            "to use the manual Focus and White balance (K) values above."
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: gray; font-size: 11px;")
-        cam_layout.addWidget(hint, hint_row, 0, 1, 3)
-
-        reset_btn = QPushButton("Reset camera settings to defaults")
-        reset_btn.clicked.connect(self.reset_camera_settings)
-        cam_layout.addWidget(reset_btn, hint_row + 1, 0, 1, 3)
-
-        cam_group.setLayout(cam_layout)
-        left_layout.addWidget(cam_group)
-
-        # Flip controls for camera orientation
-        transform_layout = QHBoxLayout()
-        self.flip_horizontal_checkbox = QCheckBox("Flip horizontally")
-        self.flip_vertical_checkbox = QCheckBox("Flip vertically")
-        transform_layout.addWidget(self.flip_horizontal_checkbox)
-        transform_layout.addWidget(self.flip_vertical_checkbox)
-        left_layout.addLayout(transform_layout)
-
-        # File path row: input + browse
-        path_layout = QHBoxLayout()
-        self.path_label = QLabel("Save to:")
-        path_layout.addWidget(self.path_label)
-        self.path_edit = QLineEdit()
-        self.path_edit.setPlaceholderText(
-            "Select a file to save or append CSV data..."
-        )
-        path_layout.addWidget(self.path_edit)
-        self.browse_button = QPushButton("Browse...")
-        self.browse_button.clicked.connect(self.browse_save_path)
-        path_layout.addWidget(self.browse_button)
-        left_layout.addLayout(path_layout)
-
-        self.append_checkbox = QCheckBox("Append to existing file")
-        self.append_checkbox.setChecked(True)
-        left_layout.addWidget(self.append_checkbox)
-
-        left_layout.addStretch(1)
-
-        # Add panels to main layout (settings on the left, feed on the right)
-        main_layout.addLayout(left_layout, stretch=0)
-        main_layout.addLayout(right_layout, stretch=1)
-
-    def detect_cameras(self):
-        self.camera_selector.clear()
-        index = 0
-        while True:
-            cap = open_camera(index)
-            if not cap.isOpened() or not cap.read()[0]:
-                cap.release()
-                break
-            self.camera_selector.addItem(f"Camera {index}", index)
-            cap.release()
-            index += 1
-
-        if self.camera_selector.count() > 0:
-            # Default to first camera; load_settings() may override with saved index
-            self.change_camera(0)
-
-    def load_settings(self):
-        """Restore saved camera index, orientation, and file path."""
-        saved_camera = self.settings.value("cameraIndex", 0, type=int)
-        for i in range(self.camera_selector.count()):
-            if self.camera_selector.itemData(i) == saved_camera:
-                self.camera_selector.blockSignals(True)
-                self.camera_selector.setCurrentIndex(i)
-                self.camera_selector.blockSignals(False)
-                self.change_camera(i)
-                break
-
-        self.flip_horizontal_checkbox.setChecked(
-            self.settings.value("flipHorizontal", False, type=bool)
-        )
-        self.flip_vertical_checkbox.setChecked(
-            self.settings.value("flipVertical", False, type=bool)
-        )
-        self.path_edit.setText(self.settings.value("saveFilePath", "", type=str))
-        self.append_checkbox.setChecked(
-            self.settings.value("appendToExisting", True, type=bool)
-        )
-        # Restore capture region if saved
-        snx = self.settings.value("selectionNormX", None)
-        sny = self.settings.value("selectionNormY", None)
-        snw = self.settings.value("selectionNormW", None)
-        snh = self.settings.value("selectionNormH", None)
-        if snx is not None and sny is not None and snw is not None and snh is not None:
-            try:
-                self.video_label.set_selection_normalized(
-                    float(snx), float(sny), float(snw), float(snh)
-                )
-            except (TypeError, ValueError):
-                pass
-
-    def save_settings(self):
-        """Persist camera index, orientation, and file path."""
-        if self.camera_selector.count() > 0:
-            self.settings.setValue(
-                "cameraIndex",
-                self.camera_selector.currentData(),
-            )
-        self.settings.setValue(
-            "flipHorizontal",
-            self.flip_horizontal_checkbox.isChecked(),
-        )
-        self.settings.setValue(
-            "flipVertical",
-            self.flip_vertical_checkbox.isChecked(),
-        )
-        self.settings.setValue("saveFilePath", self.path_edit.text().strip())
-        self.settings.setValue(
-            "appendToExisting",
-            self.append_checkbox.isChecked(),
-        )
-        norm = self.video_label.get_selection_normalized()
-        if norm is not None:
-            self.settings.setValue("selectionNormX", norm[0])
-            self.settings.setValue("selectionNormY", norm[1])
-            self.settings.setValue("selectionNormW", norm[2])
-            self.settings.setValue("selectionNormH", norm[3])
-        else:
-            self.settings.remove("selectionNormX")
-            self.settings.remove("selectionNormY")
-            self.settings.remove("selectionNormW")
-            self.settings.remove("selectionNormH")
-        self.settings.sync()
-
-    def load_camera_properties_for_current(self):
-        """Load per-camera driver properties (exposure, contrast, etc.) into UI and device."""
-        if not self.video_capture or not self.video_capture.isOpened():
-            return
-        camera_index = self.camera_selector.currentData()
-        if camera_index is None:
-            return
-        # Numeric properties
-        for prop_tuple in self.camera_props:
-            _, prop_id, key = prop_tuple[0], prop_tuple[1], prop_tuple[2]
-            spin = self.camera_controls.get(key)
-            if spin is None:
-                continue
-            setting_key = f"camera/{camera_index}/{key}"
-            saved = self.settings.value(setting_key, None)
-            if saved is not None:
-                try:
-                    val = float(saved)
-                except (TypeError, ValueError):
-                    val = self.video_capture.get(prop_id)
-                # Apply saved value to device
-                if val is not None:
-                    self.video_capture.set(prop_id, float(val))
-            else:
-                val = self.video_capture.get(prop_id)
-            if val is None:
-                continue
-            ctrl = self.camera_controls.get(key)
-            if ctrl is None:
-                continue
-            ctrl.blockSignals(True)
-            if key in self.camera_slider_keys:
-                ival = int(round(val))
-                ctrl.setValue(ival)
-                vlbl = self.camera_value_labels.get(key)
-                if vlbl is not None:
-                    vlbl.setText(str(ival))
-            else:
-                ctrl.setValue(val)
-            ctrl.blockSignals(False)
-
-        # Toggle properties (auto exposure / WB / focus)
-        for _, prop_id, key in self.camera_toggle_props:
-            chk = self.camera_toggle_controls.get(key)
-            if chk is None or prop_id is None:
-                continue
-            setting_key = f"camera/{camera_index}/{key}"
-            saved = self.settings.value(setting_key, None)
-            if saved is not None:
-                try:
-                    val = float(saved)
-                except (TypeError, ValueError):
-                    val = self.video_capture.get(prop_id)
-                if val is not None:
-                    self.video_capture.set(prop_id, float(val))
-            else:
-                val = self.video_capture.get(prop_id)
-            if val is None:
-                continue
-            checked = bool(val >= 0.5)
-            chk.blockSignals(True)
-            chk.setChecked(checked)
-            chk.blockSignals(False)
-
-    def load_resolution_for_current(self):
-        """Apply saved resolution for the currently selected camera (and update dropdown)."""
-        if self.camera_selector.count() == 0 or self.resolution_selector.count() == 0:
-            return
-        camera_index = self.camera_selector.currentData()
-        if camera_index is None:
-            return
-        saved_index = self.settings.value(
-            f"camera/{camera_index}/resolutionIndex", 0, type=int
-        )
-        if saved_index < 0 or saved_index >= self.resolution_selector.count():
-            saved_index = 0
-        self.resolution_selector.blockSignals(True)
-        self.resolution_selector.setCurrentIndex(saved_index)
-        self.resolution_selector.blockSignals(False)
-        self.change_resolution(saved_index)
-
-    def load_fps_for_current(self):
-        """Apply saved FPS for the current camera and sync timer."""
-        if self.camera_selector.count() == 0 or self.fps_selector.count() == 0:
-            return
-        camera_index = self.camera_selector.currentData()
-        if camera_index is None:
-            return
-        saved_index = self.settings.value(
-            f"camera/{camera_index}/fpsIndex", 2, type=int
-        )  # default 30 fps (index 2)
-        if saved_index < 0 or saved_index >= self.fps_selector.count():
-            saved_index = 2
-        self.fps_selector.blockSignals(True)
-        self.fps_selector.setCurrentIndex(saved_index)
-        self.fps_selector.blockSignals(False)
-        self._apply_fps_and_timer(self.fps_selector.currentData())
-
-    def _apply_fps_and_timer(self, fps_value):
-        """Set camera FPS and timer interval from FPS value."""
-        if fps_value is None or fps_value <= 0:
-            fps_value = 30
-        if self.video_capture and self.video_capture.isOpened():
-            self.video_capture.set(cv2.CAP_PROP_FPS, int(fps_value))
-        interval_ms = max(5, min(100, int(1000 / fps_value)))
-        self.timer.setInterval(interval_ms)
-
-    def change_fps(self, index):
-        """Change capture FPS and timer interval."""
-        if index < 0 or self.fps_selector.count() == 0:
-            return
-        fps_value = self.fps_selector.itemData(index)
-        if fps_value is None:
-            return
-        self._apply_fps_and_timer(fps_value)
-        camera_index = self.camera_selector.currentData()
-        if camera_index is not None:
-            self.settings.setValue(f"camera/{camera_index}/fpsIndex", int(index))
-            self.settings.sync()
-
-    def set_camera_property(self, prop_id, key, value):
-        """Apply a camera driver property via OpenCV and persist it per camera."""
-        if self.video_capture and self.video_capture.isOpened():
-            self.video_capture.set(prop_id, float(value))
-        camera_index = self.camera_selector.currentData()
-        if camera_index is not None:
-            setting_key = f"camera/{camera_index}/{key}"
-            self.settings.setValue(setting_key, float(value))
-            self.settings.sync()
-
-    def set_camera_toggle_property(self, prop_id, key, enabled):
-        """Apply a boolean-ish camera property and persist it per camera."""
-        val = 1.0 if enabled else 0.0
-        if self.video_capture and self.video_capture.isOpened():
-            self.video_capture.set(prop_id, val)
-        camera_index = self.camera_selector.currentData()
-        if camera_index is not None:
-            setting_key = f"camera/{camera_index}/{key}"
-            self.settings.setValue(setting_key, val)
-            self.settings.sync()
-
-    def change_resolution(self, index):
-        """Change capture resolution based on dropdown selection."""
-        if index < 0 or self.resolution_selector.count() == 0:
-            return
-        data = self.resolution_selector.itemData(index)
-        if not data:
-            return
-        width, height = data
-        if self.video_capture and self.video_capture.isOpened():
-            self.video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
-            self.video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
-        camera_index = self.camera_selector.currentData()
-        if camera_index is not None:
-            self.settings.setValue(
-                f"camera/{camera_index}/resolutionIndex", int(index)
-            )
-            self.settings.sync()
-
-    def reset_camera_settings(self):
-        """Reset all camera settings to defaults and apply to device."""
-        if not self.video_capture or not self.video_capture.isOpened():
-            QMessageBox.information(
-                self, "Reset",
-                "No camera open. Select a camera first."
-            )
-            return
-        camera_index = self.camera_selector.currentData()
-        if camera_index is None:
-            return
-        for prop_tuple in self.camera_props:
-            _, prop_id, key = prop_tuple[0], prop_tuple[1], prop_tuple[2]
-            default = self.camera_defaults.get(key)
-            if default is None:
-                continue
-            val = float(default) if key not in self.camera_slider_keys else int(default)
-            self.video_capture.set(prop_id, val)
-            ctrl = self.camera_controls.get(key)
-            if ctrl is not None:
-                ctrl.blockSignals(True)
-                if key in self.camera_slider_keys:
-                    ctrl.setValue(int(round(val)))
-                    vlbl = self.camera_value_labels.get(key)
-                    if vlbl is not None:
-                        vlbl.setText(str(int(round(val))))
-                else:
-                    ctrl.setValue(val)
-                ctrl.blockSignals(False)
-            self.settings.setValue(f"camera/{camera_index}/{key}", val)
-        for _, prop_id, key in self.camera_toggle_props:
-            if prop_id is None:
-                continue
-            default = self.camera_defaults.get(key, 1.0)
-            val = float(default)
-            self.video_capture.set(prop_id, val)
-            chk = self.camera_toggle_controls.get(key)
-            if chk is not None:
-                chk.blockSignals(True)
-                chk.setChecked(bool(val >= 0.5))
-                chk.blockSignals(False)
-            self.settings.setValue(f"camera/{camera_index}/{key}", val)
-        self.settings.sync()
-        QMessageBox.information(self, "Reset", "Camera settings reset to defaults.")
-
-    def change_camera(self, index):
-        if self.video_capture:
-            self.timer.stop()
-            self.video_capture.release()
-            self.video_capture = None
-
-        camera_index = self.camera_selector.itemData(index)
-        self.video_capture = open_camera(camera_index)
-        if not self.video_capture.isOpened():
-            self.video_capture = None
-            QMessageBox.warning(
-                self, "Camera error",
-                "Could not open the selected camera. Try another camera index."
-            )
-            return
-        # Apply saved resolution, FPS, and sync UI controls with this camera's driver settings
-        self.load_resolution_for_current()
-        self.load_fps_for_current()
-        self.load_camera_properties_for_current()
-        self.timer.start()
-
-    def update_frame(self):
-        if self.video_capture is None or not self.video_capture.isOpened():
-            return
-        # Drop stale frames so we always show the latest (reduces lag and stutter)
-        for _ in range(4):
-            if not self.video_capture.grab():
-                break
-        ret, frame = self.video_capture.retrieve()
-        if not ret or frame is None:
-            return
-        processed_frame = self.apply_transformations(frame)
-        self.current_frame = processed_frame
-        self.video_label.update_frame(processed_frame)
-
-    def apply_transformations(self, frame):
-        """Apply orientation adjustments (flip horizontally/vertically)."""
-        flip_h = self.flip_horizontal_checkbox.isChecked()
-        flip_v = self.flip_vertical_checkbox.isChecked()
-
-        if flip_h and flip_v:
-            # Flip both horizontally and vertically
-            return cv2.flip(frame, -1)
-        elif flip_h:
-            return cv2.flip(frame, 1)
-        elif flip_v:
-            return cv2.flip(frame, 0)
-        return frame
-
-    def preprocess_image(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        thresh = cv2.adaptiveThreshold(
-            blur, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 11, 2
-        )
-        return thresh
-
-    def capture_and_ocr(self):
-        if self.current_frame is None:
-            QMessageBox.warning(self, "Error", "No frame captured.")
-            return
-
-        frame = self.current_frame
-        sel = self.video_label.get_selection()
-        if sel is not None:
-            x, y, w, h = sel
-            frame = frame[y : y + h, x : x + w]
-
-        processed = self.preprocess_image(frame)
-        pil_image = Image.fromarray(processed)
-
-        text = pytesseract.image_to_string(pil_image)
-
-        lines = [line.strip() for line in text.split('\n') if line.strip()]
-
-        if len(lines) == 0:
-            QMessageBox.information(self, "No Text Found", "OCR did not detect text.")
-            return
-
-        # Limit to first 5 lines
-        lines = lines[:5]
-
-        # --- Sanitize the last line to numeric characters only ---
-        # Strip everything that isn't a digit or a decimal point / negative sign
+        root_layout = QVBoxLayout(central_widget)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # --- Update Banner ---
+        self.update_banner = QFrame()
+        self.update_banner.setObjectName("UpdateBanner")
+        self.update_banner.setStyleSheet("""
         last = lines[-1]
         numeric_only = re.sub(r"[^0-9.\-]", "", last)
-        lines[-1] = numeric_only if numeric_only else last  # keep original if nothing survived
+        lines[-1] = numeric_only if numeric_only else last
 
-        # --- Open the edit dialog so the user can review / adjust values ---
-        dialog = OCREditDialog(lines, parent=self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            # User cancelled – discard this scan
+        # Load scanned data into the inline review panel (new-record mode)
+        self._review_editing_csv_row = None
+        self._review_populate(lines, status="New scan — edit if needed, then save.")
+
+    # ── Inline review-panel helpers ─────────────────────────────────────────
+
+    def _review_populate(self, lines, status="Edit fields, then save.", hospital_val=""):
+        """Fill the inline review form with `lines` and make it visible."""
+        _rx = QRegularExpression(r"[a-zA-Z0-9/ ]*")
+        _validator = QRegularExpressionValidator(_rx)
+
+        # Clear previous widgets from the form
+        while self._review_form_layout.rowCount():
+            self._review_form_layout.removeRow(0)
+        self._review_edits.clear()
+
+        for i, line in enumerate(lines):
+            lbl = f"Field {i + 1}:"
+            clean = re.sub(r"[^a-zA-Z0-9/ ]", "", line)
+            edit = QLineEdit(clean)
+            edit.setValidator(_validator)
+            self._review_form_layout.addRow(lbl, edit)
+            self._review_edits.append(edit)
+
+        # Add hospital dropdown at the end
+        h_lbl = QLabel("Hospital Facility:")
+        self.hospital_dropdown = QComboBox()
+        self.hospital_dropdown.setEditable(True)
+        self.hospital_dropdown.addItems(self.hospital_list)
+        
+        # Prevent expanding layout by setting fixed size policy and elide mode
+        self.hospital_dropdown.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.hospital_dropdown.setMinimumWidth(150)
+        
+        # Set up completer
+        completer = QCompleter(self.hospital_list)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.hospital_dropdown.setCompleter(completer)
+        
+        if not hospital_val and self.settings.value("rememberFacility", False, type=bool):
+            hospital_val = self.last_saved_facility
+            
+        if hospital_val:
+            self.hospital_dropdown.setCurrentText(hospital_val)
+            
+        self._review_form_layout.addRow(h_lbl, self.hospital_dropdown)
+
+        self._review_status_label.setText(status)
+        self.review_group.setVisible(True)
+        if self._review_edits:
+            self._review_edits[0].setFocus()
+
+    def _review_save(self):
+        """Save the current review-form values to the CSV."""
+        final_lines = [e.text() for e in self._review_edits]
+        
+        # Append hospital value
+        facility_val = self.hospital_dropdown.currentText().strip()
+        final_lines.append(facility_val)
+        self.last_saved_facility = facility_val
+        self.settings.setValue("lastSavedFacility", self.last_saved_facility)
+
+        file_path = self.path_edit.text().strip()
+        if not file_path:
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Save CSV", "", "CSV Files (*.csv)"
+            )
+            if file_path:
+                self.path_edit.setText(file_path)
+        if not file_path:
             return
 
-        final_lines = dialog.get_values()
+        try:
+            if self._review_editing_csv_row is None:
+                # Append new row
+                append_mode = self.append_checkbox.isChecked()
+                mode = 'a' if append_mode else 'w'
+                with open(file_path, mode=mode, newline='', encoding='utf-8') as f:
+                    csv.writer(f).writerow(final_lines)
+            else:
+                # Overwrite the specific row in place
+                with open(file_path, mode='r', newline='', encoding='utf-8') as f:
+                    rows = list(csv.reader(f))
+                # Map history-list index (reversed) back to actual row index
+                actual_idx = (len(rows) - 1) - self._review_editing_csv_row
+                if 0 <= actual_idx < len(rows):
+                    rows[actual_idx] = final_lines
+                with open(file_path, mode='w', newline='', encoding='utf-8') as f:
+                    csv.writer(f).writerows(rows)
 
-        # Append to pending data and write to CSV
-        self.extracted_data.append(final_lines)
-        self.export_to_csv()
+            self.review_group.setVisible(False)
+            self._review_editing_csv_row = None
+            self._review_edits.clear()
+            self.refresh_history()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", str(e))
+
+    def _review_cancel(self):
+        """Dismiss the review panel without saving."""
+        self.review_group.setVisible(False)
+        self._review_editing_csv_row = None
+        self._review_edits.clear()
+
+    # ── History panel helpers ───────────────────────────────────────────────
+
+    def _on_history_selection_changed(self):
+        has_sel = bool(self.history_list.selectedItems())
+        self.hist_edit_btn.setEnabled(has_sel)
+        self.hist_delete_btn.setEnabled(has_sel)
+
+    def _history_edit_row(self):
+        """Load the selected history row into the inline review panel for editing."""
+        items = self.history_list.selectedItems()
+        if not items:
+            return
+        item = items[0]
+        row_data = item.data(Qt.ItemDataRole.UserRole)  # list of field strings
+        if row_data is None:
+            return
+            
+        hospital_val = ""
+        if row_data:
+            if len(row_data) > 5 or row_data[-1] in self.hospital_list:
+                hospital_val = row_data[-1]
+                row_data = row_data[:-1]
+                
+        # Store the visual index (0 = newest) so _review_save can map it back
+        self._review_editing_csv_row = self.history_list.row(item)
+        self._review_populate(
+            row_data,
+            status=f"Editing row {self._review_editing_csv_row + 1} — save to update CSV.",
+            hospital_val=hospital_val
+        )
+
+    def _history_delete_row(self):
+        """Delete the selected row from the CSV and refresh the history panel."""
+        items = self.history_list.selectedItems()
+        if not items:
+            return
+        item = items[0]
+        visual_idx = self.history_list.row(item)  # 0 = newest
+
+        file_path = self.path_edit.text().strip()
+        if not file_path:
+            QMessageBox.warning(self, "No File", "No CSV file is selected.")
+            return
+
+        reply = QMessageBox.question(
+            self, "Delete Row",
+            "Delete this record from the CSV file?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            with open(file_path, mode='r', newline='', encoding='utf-8') as f:
+                rows = list(csv.reader(f))
+            actual_idx = (len(rows) - 1) - visual_idx
+            if 0 <= actual_idx < len(rows):
+                rows.pop(actual_idx)
+            with open(file_path, mode='w', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerows(rows)
+            # Hide review panel if we just deleted the row being edited
+            if self._review_editing_csv_row == visual_idx:
+                self._review_cancel()
+            self.refresh_history()
+        except Exception as e:
+            QMessageBox.critical(self, "Delete Error", str(e))
 
     def browse_save_path(self):
         """Open file dialog to choose where to save or which file to append to."""
@@ -972,16 +1037,76 @@ class OCRScanner(QMainWindow):
                     for entry in self.extracted_data:
                         writer.writerow(entry)
 
-                QMessageBox.information(self, "Success", "Data exported successfully!")
                 self.extracted_data.clear()
+                self.refresh_history()
 
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
+
+    def refresh_history(self):
+        """Re-read the CSV file and populate the history panel (most recent row first)."""
+        self.history_list.clear()
+        file_path = self.path_edit.text().strip()
+        if not file_path:
+            return
+        try:
+            with open(file_path, mode='r', newline='', encoding='utf-8') as f:
+                rows = list(csv.reader(f))
+            # Show most-recent rows at the top
+            for row in reversed(rows):
+                if not any(cell.strip() for cell in row):
+                    continue  # skip blank rows
+                display = "  |  ".join(row)
+                item = QListWidgetItem(display)
+                item.setToolTip("\n".join(row))
+                # Store the raw row so edit can access fields by index
+                item.setData(Qt.ItemDataRole.UserRole, list(row))
+                self.history_list.addItem(item)
+        except FileNotFoundError:
+            pass  # no file yet — history stays empty
+        except Exception as e:
+            self.history_list.addItem(QListWidgetItem(f"[Error reading history: {e}]"))
+
+    def _clear_history(self):
+        """Clear the history display (does NOT delete the CSV file)."""
+        self.history_list.clear()
 
     def closeEvent(self, event):
         """Save config when closing the window."""
         self.save_settings()
         event.accept()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        event.accept()
+
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent, Qt
+        if event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                # Ensure our window is active, ignoring if a dialog (like Preferences) is open
+                if self.isActiveWindow():
+                    # If completer popup is open, let it consume the Enter key
+                    if hasattr(self, 'hospital_dropdown') and self.hospital_dropdown.completer():
+                        if self.hospital_dropdown.completer().popup() and self.hospital_dropdown.completer().popup().isVisible():
+                            return super().eventFilter(obj, event)
+
+                    if self.review_group.isVisible():
+                        self._review_save()
+                        return True
+                    elif self.history_list.hasFocus() and self.history_list.selectedItems():
+                        self._history_edit_row()
+                        return True
+                    elif not isinstance(self.focusWidget(), (QLineEdit, QDoubleSpinBox, QComboBox)):
+                        self.capture_and_ocr()
+                        return True
+        return super().eventFilter(obj, event)
+
+    def _manual_entry(self):
+        """Open the review panel with empty fields for manual data entry."""
+        self._review_editing_csv_row = None
+        # Default to 5 empty fields
+        self._review_populate(["", "", "", "", ""], status="Manual Entry — enter details, then save.")
 
 
 if __name__ == "__main__":

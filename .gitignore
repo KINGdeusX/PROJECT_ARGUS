@@ -4,15 +4,42 @@ __pycache__/
 *.pyo
 *.pyd
 *.log
+*.egg-info/
+dist-info/
 
 # Virtual Environment
 venv/
+.venv/
 .env/
+env/
 
-# IDE
+# Build / PyInstaller output
+build/
+dist/
+*.spec.bak
+
+# Packaged binaries (never commit compiled EXEs — distribute via GitHub Releases)
+*.exe
+*.msi
+*.zip
+*.tar.gz
+
+# IDE / Editor
 .vscode/
 .idea/
+*.sublime-project
+*.sublime-workspace
 
-# OS
+# OS artefacts
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# Test / coverage
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Temporary files
+*.tmp
+*.bak
