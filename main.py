@@ -697,6 +697,11 @@ class OCRScanner(QMainWindow):
         exit_action = file_menu.addAction("Exit")
         exit_action.triggered.connect(self.close)
         
+        # --- Tools Menu ---
+        tools_menu = menubar.addMenu("Tools")
+        manual_entry_action = tools_menu.addAction("Manual Entry")
+        manual_entry_action.triggered.connect(self._manual_entry)
+        
         # --- Help Menu ---
         help_menu = menubar.addMenu("Help")
         
@@ -858,16 +863,35 @@ class OCRScanner(QMainWindow):
         self.capture_button.setStyleSheet("font-size: 16px; font-weight: bold;")
         self.capture_button.clicked.connect(self.capture_and_ocr)
 
+        self.manual_button = QPushButton("Manual Entry")
+        self.manual_button.setMinimumHeight(40)
+        self.manual_button.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.manual_button.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.manual_button.clicked.connect(self._manual_entry)
+        self.manual_button.setVisible(False)
+
         right_layout = QVBoxLayout()
         right_layout.addWidget(self.video_label, stretch=1)
         
-        # Center the capture button
+        # Center the capture buttons
+        buttons_layout = QVBoxLayout()
+        
         capture_row = QHBoxLayout()
         capture_row.addStretch()
         capture_row.addWidget(self.capture_button, stretch=1)
         capture_row.addStretch()
         
-        right_layout.addLayout(capture_row, stretch=0)
+        manual_row = QHBoxLayout()
+        manual_row.addStretch()
+        manual_row.addWidget(self.manual_button, stretch=1)
+        manual_row.addStretch()
+        
+        buttons_layout.addLayout(capture_row)
+        buttons_layout.addLayout(manual_row)
+        
+        right_layout.addLayout(buttons_layout, stretch=0)
 
         # --- Left panel: all controls/settings ---
         left_layout = QVBoxLayout()
@@ -1453,8 +1477,11 @@ class OCRScanner(QMainWindow):
         lines = [line.strip() for line in text.split('\n') if line.strip()]
 
         if len(lines) == 0:
-            QMessageBox.information(self, "No Text Found", "OCR did not detect text.")
+            self.manual_button.setVisible(True)
+            QMessageBox.information(self, "No Text Found", "OCR did not detect text. Manual entry is available below the capture button.")
             return
+
+        self.manual_button.setVisible(False)
 
         # Limit to first 5 lines
         lines = lines[:5]
@@ -1737,6 +1764,12 @@ class OCRScanner(QMainWindow):
                         self.capture_and_ocr()
                         return True
         return super().eventFilter(obj, event)
+
+    def _manual_entry(self):
+        """Open the review panel with empty fields for manual data entry."""
+        self._review_editing_csv_row = None
+        # Default to 5 empty fields
+        self._review_populate(["", "", "", "", ""], status="Manual Entry — enter details, then save.")
 
 
 if __name__ == "__main__":
